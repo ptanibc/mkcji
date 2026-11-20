@@ -1,0 +1,7 @@
+.env
+rctv_config.py
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc

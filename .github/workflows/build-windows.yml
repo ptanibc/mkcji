@@ -1,0 +1,72 @@
+name: Build Windows App
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: "Version name (default 1.0)"
+        required: false
+        default: "1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install telethon==1.38.1 aiohttp==3.10.10 cryptg pyinstaller pillow
+
+      # Config exe ke andar bake karo (repo secrets se — source me kabhi nahi)
+      - name: Inject config
+        env:
+          S_API_HASH: ${{ secrets.TG_API_HASH }}
+          S_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        shell: bash
+        run: |
+          echo "::add-mask::$S_API_HASH"
+          echo "::add-mask::$S_BOT_TOKEN"
+          cat > windows/rctv_config.py <<EOF
+          API_ID = 14116809
+          API_HASH = "$S_API_HASH"
+          BOT_TOKEN = "$S_BOT_TOKEN"
+          GROUP_ID = -1003904890252
+          ADMIN_ID = 1345802943
+          PORT = 8090
+          EOF
+
+      - name: Build exe
+        run: >
+          pyinstaller --onefile --noconsole --name RC-TV-Windows
+          --icon windows/rctv.ico
+          --add-data "windows/rctv.ico;."
+          windows/rctv_win.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RC-TV-Windows
+          path: dist/RC-TV-Windows.exe
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: win-v${{ github.event.inputs.version_name }}
+          name: RC TV Windows v${{ github.event.inputs.version_name }}
+          body: |
+            RC TV — Windows app (Telegram storage player + self-heal)
+
+            - Ek single exe: download karo, double-click karo, bas
+            - TV app wala hi auto-fix: door-DC (dc1/2/3) videos bot khud re-upload karke theek karta hai
+            - TV/phone pairing: same WiFi me http://<PC-IP>:8090/ ko TV app ke Settings > Server me daalo
+            - Data: %APPDATA%\RCTV\
+
+            SmartScreen poochhe to "More info" > "Run anyway".
+          files: dist/RC-TV-Windows.exe
