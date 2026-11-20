@@ -12,7 +12,7 @@
 import asyncio, base64, json, os, random, re, shutil, socket, subprocess, sys, threading, time, traceback, webbrowser
 from pathlib import Path
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 # ---------------- config ----------------
 
@@ -1141,7 +1141,7 @@ class App:
         self.h_sub = tk.Label(bar, text="", bg=BG, fg=SUB, font=FONT_S)
         self.h_sub.pack(side="left", padx=(12, 0))
         self._chip(bar, "Rescan", self.do_scan).pack(side="right", padx=(8, 0))
-        self._chip(bar, "Web UI", lambda: webbrowser.open(base_url() + "/")).pack(side="right", padx=(8, 0))
+        self._chip(bar, "📺 Live TV", self.open_live).pack(side="right", padx=(8, 0))
         self._chip(bar, "About", self.about).pack(side="right")
 
     def _chipsbar(self, root):
@@ -1343,12 +1343,19 @@ class App:
     def open_item(self, mid, kind):
         url = f"{base_url()}/f/{mid}"
         if kind in ("video", "audio"):
-            play_url(url)
-        else:  # photo/sub — browser/viewer
+            it = index.get(mid) or {}
+            PlayerWin(self.root, url, title=(it.get("title") or "RC TV"),
+                      audio=(kind == "audio"))
+        elif kind == "photo":
+            PhotoWin(self.root, url)
+        else:  # sub/doc — system viewer
             try:
                 os.startfile(url)
             except Exception:
                 webbrowser.open(url)
+
+    def open_live(self):
+        LiveWin(self.root)
 
     def copy_link(self, mid):
         if mid:
@@ -1381,10 +1388,11 @@ class App:
         messagebox.showinfo(
             "RC TV", f"RC TV — Windows v{VERSION}\n"
             f"Storage: {state['title'] or CFG['GROUP_ID']} · Data: {HOME}\n\n"
-            f"Isi PC: {base_url()}/\n"
-            f"TV/phone (same WiFi): http://{state['lan'] or lan_ip()}:{CFG['PORT']}/\n\n"
-            f"TV app > Settings > Server me upar wala URL dalo to TV bhi isi PC se chalega.\n"
-            f"Card par click = play · right-click = menu · door-DC video khud fix hoti hai.")
+            f"• Video/Music/Photo — sab APP KE ANDAR chalte hain (built-in mpv player)\n"
+            f"• 📺 Live TV: 2000+ channels (JioStar/+PlusTV/InPlex+)\n"
+            f"• TV/phone (same WiFi): http://{state['lan'] or lan_ip()}:{CFG['PORT']}/\n\n"
+            f"Player keys: Esc/q band · Space pause · ←→ seek · Up/Down volume · F fullscreen\n"
+            f"Right-click = menu · door-DC video khud fix hoti hai.")
 
     def refresh(self):
         self.sig = None  # force rebuild
@@ -1462,6 +1470,655 @@ class App:
             pass
 
 
+# ================= in-app playback: mpv (browser/VLC ki zaroorat nahi) =================
+# libmpv-2.dll exe ke bagal me bundled hai — video/audio sab APP KE ANDAR chalta hai.
+import ctypes
+
+_MPV = None
+_MPV_TRIED = False
+
+
+def _mpv():
+    global _MPV, _MPV_TRIED
+    if _MPV_TRIED:
+        return _MPV
+    _MPV_TRIED = True
+    cands = [Path(getattr(sys, "_MEIPASS", "")) / "libmpv-2.dll",
+             app_dir() / "libmpv-2.dll", Path.cwd() / "libmpv-2.dll"]
+    for c in cands:
+        try:
+            c = c.resolve()
+            if c.exists():
+                try:
+                    os.add_dll_directory(str(c.parent))  # dependencies bhi isi folder me
+                except Exception:
+                    pass
+                _MPV = ctypes.CDLL(str(c))
+                _mpv_bind(_MPV)
+                log("mpv: " + c.name + " loaded")
+                return _MPV
+        except Exception as e:
+            log(f"mpv load fail {c}: {e}")
+    log("mpv: libmpv-2.dll nahi mila")
+    return None
+
+
+def _mpv_bind(m):
+    m.mpv_create.restype = ctypes.c_void_p
+    m.mpv_initialize.argtypes = [ctypes.c_void_p]
+    m.mpv_initialize.restype = ctypes.c_int
+    m.mpv_terminate_destroy.argtypes = [ctypes.c_void_p]
+    m.mpv_set_option_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+    m.mpv_set_option_string.restype = ctypes.c_int
+    m.mpv_set_property_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+    m.mpv_set_property_string.restype = ctypes.c_int
+    m.mpv_get_property_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    m.mpv_get_property_string.restype = ctypes.c_char_p
+    m.mpv_command.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p)]
+    m.mpv_command.restype = ctypes.c_int
+    m.mpv_free.argtypes = [ctypes.c_void_p]
+    m.mpv_request_log_messages.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+
+
+def _mmss(t):
+    try:
+        t = int(float(t))
+    except Exception:
+        return "0:00"
+    return f"{t // 60}:{t % 60:02d}"
+
+
+class PlayerWin:
+    """Ek hi playback = ek chhota mpv instance app ke andar embed.
+    Keys: Space=pause · <-/-> seek ±10s · Up/Down volume · F/double-click fullscreen · M mute · Esc/q band."""
+
+    def __init__(self, master, url, title="", headers=None, audio=False, live=False):
+        self.url = url
+        self.title = title or "RC TV"
+        self.live = live
+        self.audio = audio
+        self.full = False
+        self.h = None
+        self.dead = False
+        w, hgt = (520, 120) if audio else (960, 560)
+        self.win = tk.Toplevel(master)
+        self.win.title(("LIVE  ▶  " if live else "▶  ") + self.title)
+        self.win.configure(bg="#000000")
+        self.win.geometry(f"{w}x{hgt}" if not audio else f"{w}x{hgt}")
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.frame = tk.Frame(self.win, bg="#000000")
+        self.frame.pack(fill="both", expand=True)
+        if audio:
+            tk.Label(self.frame, text="♪  " + self.title, bg="#000000", fg=ACC2,
+                     font=("Segoe UI", 13, "bold"), wraplength=480).pack(expand=True)
+        self.stat = tk.Label(self.win, text="player start ho raha hai…", bg="#0A0A0C",
+                             fg=SUB, font=("Segoe UI", 9), anchor="w")
+        self.stat.pack(fill="x")
+
+        for seq in ("<Escape>", "<q>"):
+            self.win.bind(seq, lambda e: self.close())
+        for seq in ("<space>", "<f>", "<m>", "<Left>", "<Right>", "<Up>", "<Down>",
+                   "<Double-Button-1>", "<MouseWheel>"):
+            self.win.bind(seq, self._key)
+        self.frame.bind("<Double-Button-1>", self._key)
+        self.frame.bind("<MouseWheel>", self._key)
+
+        self._start(headers)
+        self.win.after(600, self._tick)
+
+    # ---- mpv boot ----
+    def _start(self, headers):
+        m = _mpv()
+        if not m:
+            self.stat.configure(text="⚠ player (libmpv-2.dll) load nahi hua — app dobara install karo")
+            return
+        try:
+            self.frame.update_idletasks()
+            self.win.update()
+            h = ctypes.c_void_p(m.mpv_create())
+            if not h:
+                raise RuntimeError("mpv_create null")
+            _o = lambda k, v: m.mpv_set_option_string(h, k.encode(), str(v).encode())
+            _o("wid", self.frame.winfo_id()) if not self.audio else None
+            if self.audio:
+                _o("vo", "null")          # audio: sirf chhota window, koi video layer nahi
+                _o("force-window", "no")
+            else:
+                _o("vo", "gpu,gdi")        # gpu nahi to software
+                _o("force-window", "yes")
+            _o("hwdec", "auto-safe")
+            _o("osc", "no")                # control sab app ke pass — mpv apna UI nahi banata
+            _o("input-default-bindings", "no")
+            _o("input-vo-keyboard", "no")
+            _o("keep-open", "always")
+            _o("idle", "yes")
+            _o("cache", "yes")
+            _o("demuxer-max-bytes", "128MiB")
+            _o("demuxer-readahead-secs", "20")
+            _o("volume", "100")
+            _o("audio-display", "no")
+            if self.live:
+                _o("demuxer-lavf-o", "live=1")
+            hdrs = []
+            for k, v in (headers or {}).items():
+                hdrs.append(f"{k.capitalize()}: {str(v).replace(',', '')}")
+            if hdrs:
+                _o("http-header-fields", ",".join(hdrs))
+                _o("user-agent", headers.get("user-agent") or UA_LIVE)
+            if m.mpv_initialize(h) != 0:
+                raise RuntimeError("mpv_initialize fail")
+            m.mpv_request_log_messages(h, b"warn")
+            self.h = h
+            argv = (ctypes.c_char_p * 3)(b"loadfile", self.url.encode(), None)
+            if m.mpv_command(h, argv) != 0:
+                raise RuntimeError("loadfile fail")
+            log(f"player: loadfile {self.title[:40]} live={self.live}")
+        except Exception as e:
+            self.stat.configure(text="⚠ player error: " + str(e)[:120])
+            log("player error: " + repr(e))
+
+    def _prop(self, name):
+        if not self.h:
+            return None
+        m = _MPV
+        v = m.mpv_get_property_string(self.h, name.encode())
+        if not v:
+            return None
+        s = v.decode(errors="ignore")
+        m.mpv_free(v)
+        return s
+
+    def _cmd(self, *args):
+        if not self.h:
+            return
+        argv = (ctypes.c_char_p * (len(args) + 1))(*[a.encode() for a in args], None)
+        _MPV.mpv_command(self.h, argv)
+
+    def _setp(self, name, val):
+        if self.h:
+            _MPV.mpv_set_property_string(self.h, name.encode(), str(val).encode())
+
+    # ---- keys ----
+    def _key(self, e):
+        k = getattr(e, "keysym", "")
+        if k == "Escape" or k == "q":
+            self.close()
+        elif k == "space":
+            p = self._prop("pause")
+            self._setp("pause", "no" if p == "yes" else "yes")
+        elif k == "m":
+            p = self._prop("mute")
+            self._setp("mute", "no" if p == "yes" else "yes")
+        elif k == "f" or k == "Double-Button-1":
+            self.full = not self.full
+            try:
+                self.win.attributes("-fullscreen", self.full)
+            except Exception:
+                pass
+        elif k == "Left" and not self.live:
+            self._cmd("seek", "-10")
+        elif k == "Right" and not self.live:
+            self._cmd("seek", "10")
+        elif k == "Up":
+            self._setp("volume", min(130, int(float(self._prop("volume") or 100) + 8)))
+        elif k == "Down":
+            self._setp("volume", max(0, int(float(self._prop("volume") or 100) - 8)))
+        elif k == "MouseWheel" and not self.live:
+            d = -1 if getattr(e, "delta", 0) > 0 else 1
+            self._cmd("seek", str(15 * d))
+        return "break"
+
+    # ---- 600ms poll: progress title + eof ----
+    def _tick(self):
+        if self.dead:
+            return
+        try:
+            if self.h:
+                dur = self._prop("duration")
+                pos = self._prop("time-pos")
+                paused = self._prop("pause") == "yes"
+                speed = self._prop("speed")
+                if self.live:
+                    self.win.title("LIVE  ▶  " + self.title)
+                elif dur:
+                    self.win.title(f"{'⏸' if paused else '▶'}  {self.title}  "
+                                   f"—  {_mmss(pos)} / {_mmss(dur)}")
+                    self.stat.configure(text=f"{_mmss(pos)} / {_mmss(dur)}  "
+                                             f"(Esc band · Space pause · ←→ seek · F fullscreen)")
+                else:
+                    self.stat.configure(text="buffer ho raha hai…" if not paused else "paused")
+            eof = self._prop("eof-reached")
+            if eof == "True" and not self.live:
+                self.stat.configure(text="✓ khatam — Esc dabao ya band kar do")
+        except Exception:
+            pass
+        self.win.after(600, self._tick)
+
+    def close(self):
+        if self.dead:
+            return
+        self.dead = True
+        try:
+            if self.h:
+                _MPV.mpv_terminate_destroy(self.h)
+                self.h = None
+        except Exception:
+            pass
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
+# ---- photos: PIL viewer (app ke andar, browser nahi) ----
+class PhotoWin:
+    def __init__(self, master, url):
+        self.url = url
+        self.win = tk.Toplevel(master)
+        self.win.title("RC TV — photo")
+        self.win.configure(bg="#050507")
+        self.win.geometry("880x620")
+        self.zoom = 1.0
+        self.img0 = None
+        self.lbl = tk.Label(self.win, bg="#050507", text="load ho raha hai…", fg=SUB)
+        self.lbl.pack(fill="both", expand=True)
+        self.win.bind("<Escape>", lambda e: self.win.destroy())
+        self.win.bind("<MouseWheel>", self._wheel)
+        self.win.bind("<Double-Button-1>", lambda e: self._render(1.0))
+        self.win.protocol("WM_DELETE_WINDOW", self.win.destroy)
+        self._fetch()
+
+    def _fetch(self):
+        from PIL import Image
+        self._Image = Image
+        def work():
+            try:
+                req = urllib.request.Request(self.url, headers={"User-Agent": "rctv"})
+                data = urllib.request.urlopen(req, timeout=30).read()
+                self.win.after(0, lambda: self._got(data))
+            except Exception as e:
+                self.win.after(0, lambda: self.lbl.configure(text="photo load fail: " + str(e)[:80]))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _got(self, data):
+        import io
+        try:
+            self.img0 = self._Image.open(io.BytesIO(data))
+            self.img0.load()
+            self._render(1.0)
+        except Exception as e:
+            self.lbl.configure(text="photo khol nahi paye: " + str(e)[:80])
+
+    def _render(self, zoom):
+        if not self.img0:
+            return
+        from PIL import ImageTk
+        self.zoom = max(0.05, min(12.0, zoom))
+        w, h = self.img0.size
+        base = min((self.win.winfo_width() or 860) / w, (self.win.winfo_height() or 600) / h, 1.0)
+        s = base * self.zoom
+        im = self.img0.resize((max(1, int(w * s)), max(1, int(h * s))))
+        self.ph = ImageTk.PhotoImage(im)
+        self.lbl.configure(image=self.ph, text="")
+        self.win.title(f"RC TV — photo  {int(self.zoom * 100)}%")
+
+    def _wheel(self, e):
+        d = 1.15 if getattr(e, "delta", 0) > 0 else 1 / 1.15
+        self._render(self.zoom * d)
+
+
+# ================= Live TV (TV app wale 3 servers — 2000+ channels) =================
+UA_LIVE = ("Mozilla/5.0 (Linux; Android 9; Mi TV) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+LIVE_SERVERS = [
+    ("JioStar", ["https://lemajekaat.streamxlive.workers.dev/",
+                 "https://endless.livenoww.workers.dev/",
+                 "https://api.npoint.io/5122554ee81206923fa7"]),
+    ("+PlusTV", ["https://api.npoint.io/9db02feba76eb297fc65"]),
+    ("InPlex+", ["https://api.npoint.io/6dd4e6633c5c07b76d47"]),
+]
+
+_CAT_RE = [
+    (r"\b(SPORTS?|CRICKET|FOOTBALL|ESPN|STARZPLAY|TENNIS|HOCKEY|KABADDI|TEN\s?SPORTS?)\b", "Sports"),
+    (r"\b(NEWS|AAJ TAK|NDTV|CNN|BBC|REPUBLIC|ABP|INDIA TV|TIMES NOW|NEWS18)\b", "News"),
+    (r"\b(KIDS?|CARTOON|DISNEY|POGO|NICK|NICKELODEON|CHUTTI|SONY YAY|KUSHI|KOCHU|CHINTU|BABYTV)\b", "Kids"),
+    (r"\b(MOVIES?|CINEMA|MAX|HBO|PICTURES|PIX|MINIPLEX|STAR GOLD|GOLDMINES)\b", "Movies"),
+    (r"\b(MUSIC|MTV|SANGEET|9XM|B4U)\b", "Music"),
+]
+
+
+def _live_map(o):
+    name = (o.get("name") or o.get("channel_name") or "").strip()
+    if not name or name.lower() == "null":
+        return None
+    url = ""
+    for f in ("mpd_url", "m3u8_url", "url", "channel_url", "link", "stream_url"):
+        v = (o.get(f) or "").strip()
+        if v and v.lower() != "null":
+            url = v
+            break
+    if not url:
+        return None
+    hdrs = {}
+    if "|" in url:  # url|Cookie=..|User-Agent=..
+        parts = url.split("|")
+        url = parts[0].strip()
+        for p in parts[1:]:
+            i = p.find("=")
+            if i > 0:
+                hdrs[p[:i].strip().lower()] = p[i + 1:].strip()
+    def gv(*fs):
+        for f in fs:
+            v = (o.get(f) or "").strip()
+            if v and v.lower() != "null":
+                return v
+        return ""
+    ck = gv("cookie") or ((o.get("headers") or {}).get("cookie")
+                          if isinstance(o.get("headers"), dict) else "")
+    if ck:
+        hdrs["Cookie"] = ck
+    for f in ("referer", "referrer"):
+        v = gv(f)
+        if v:
+            hdrs["Referer"] = v
+    v = gv("origin")
+    if v:
+        hdrs["Origin"] = v
+    hd = o.get("headers")
+    if isinstance(hd, dict):
+        for k, v in hd.items():
+            if isinstance(v, str) and v and v.lower() != "null":
+                hdrs[str(k).strip().lower()] = v
+    cat = ""
+    for f in ("group", "category", "cat", "channel_genre", "genre", "type", "language"):
+        v = (o.get(f) or "").strip()
+        if v and v.lower() != "null":
+            cat = v
+            break
+    if not cat:
+        for rx, c in _CAT_RE:
+            if re.search(rx, name, re.I):
+                cat = c
+                break
+        cat = cat or "Entertainment"
+    lic = gv("all_keys", "allKeys", "allkeys")
+    if not lic:
+        lic = gv("license_url", "licenseUrl", "drmLicense", "drm_license")
+    if not lic:
+        kid = gv("keyId", "kid", "key_id")
+        key = gv("key", "KID", "drm_key")
+        if kid and key:
+            lic = kid + ":" + key
+    return {"name": name, "url": url,
+            "backup": gv("url_backup"), "logo": gv("logo", "channel_logo"),
+            "cat": cat.title()[:20], "hdrs": hdrs, "drm": bool(lic)}
+
+
+def _live_score(c):
+    s = 2 if c["url"] else 0
+    s += 2 if ".m3u8" in c["url"] else 0
+    s += 1 if c["backup"] else 0
+    s += 1 if c["hdrs"] else 0
+    return s
+
+
+def _live_parse(text):
+    try:
+        d = json.loads(text)
+    except Exception:
+        return []
+    arr = d if isinstance(d, list) else None
+    if arr is None and isinstance(d, dict):
+        arr = d.get("channels") or d.get("data")
+    if not isinstance(arr, list):
+        return []
+    out = []
+    for o in arr:
+        if isinstance(o, dict):
+            c = _live_map(o)
+            if c:
+                out.append(c)
+    return out
+
+
+def _live_fetch_server(si):
+    name, sources = LIVE_SERVERS[si]
+    raw = []
+    cf = HOME / f"live_cache_{si}.json"
+    for s in sources:
+        try:
+            req = urllib.request.Request(s, headers={"User-Agent": UA_LIVE})
+            text = urllib.request.urlopen(req, timeout=14).read().decode(errors="ignore")
+            got = _live_parse(text)
+            if got:
+                raw.extend(got)
+                try:
+                    cf.write_text(json.dumps(got[:3000], ensure_ascii=False))
+                except Exception:
+                    pass
+        except Exception as e:
+            log(f"live[{name}] {s} fail: {type(e).__name__}")
+    if not raw and cf.exists():
+        try:
+            raw = json.loads(cf.read_text())
+            log(f"live[{name}] cache se aaya ({len(raw)})")
+        except Exception:
+            pass
+    by = {}
+    for c in sorted(raw, key=_live_score, reverse=True):
+        by.setdefault(c["name"].lower().strip(), c)
+    chans = list(by.values())
+    chans.sort(key=lambda c: c["name"].lower())
+    return chans
+
+
+class LiveWin:
+    """Live TV: server chips + category chips + search + logo grid. Sab app ke andar."""
+
+    def __init__(self, master):
+        self.win = tk.Toplevel(master)
+        self.win.title("RC TV — Live TV")
+        self.win.configure(bg=BG)
+        try:
+            self.win.state("zoomed")
+        except Exception:
+            self.win.geometry("1020x680")
+        self.win.bind("<Escape>", lambda e: self.win.destroy())
+        self.pool = ThreadPoolExecutor(max_workers=8)
+        self.chans = []
+        self.server = 0
+        self.cat = "All"
+        self.logos = {}
+        self.sig = None
+
+        top = tk.Frame(self.win, bg=BG)
+        top.pack(fill="x", padx=16, pady=(10, 4))
+        tk.Label(top, text="📺 Live TV", bg=BG, fg=ACC, font=FONT_H).pack(side="left")
+        self.sub = tk.Label(top, text="", bg=BG, fg=SUB, font=FONT_S)
+        self.sub.pack(side="left", padx=14)
+        self.q = tk.StringVar()
+        e = tk.Entry(top, textvariable=self.q, bg="#14141A", fg=TXT, insertbackground=TXT,
+                     relief="flat", width=24, font=FONT_S)
+        e.pack(side="right", ipady=4)
+        e.bind("<KeyRelease>", lambda ev: self._invalidate())
+
+        self.chips = tk.Frame(self.win, bg=BG)
+        self.chips.pack(fill="x", padx=16)
+        self._chip("All", lambda: self._setcat("All")).pack(side="left", padx=(0, 6))
+        self.wrap = tk.Frame(self.win, bg=BG)
+        self.wrap.pack(fill="both", expand=True, padx=16, pady=8)
+        self.canvas = tk.Canvas(self.wrap, bg=BG, highlightthickness=0)
+        sb = tk.Scrollbar(self.wrap, orient="vertical", command=self.canvas.yview,
+                          bg=BG, troughcolor="#14141A", width=10)
+        self.gridfr = tk.Frame(self.canvas, bg=BG)
+        self.canvas.create_window((0, 0), window=self.gridfr, anchor="nw")
+        self.canvas.configure(yscrollcommand=sb.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.gridfr.bind("<Configure>", lambda e: self.canvas.configure(
+            scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind_all("<MouseWheel>", lambda e: self.canvas.yview_scroll(
+            -1 if e.delta > 0 else 1, "units"))
+        self.cols = 5
+        self.cards = {}
+        self.load()
+        self.win.after(500, self._tick)
+
+    def _chip(self, text, cmd=None):
+        ch = tk.Label(self.chips, text=text, bg="#14141A", fg=SUB, font=FONT_S,
+                      padx=12, pady=5, cursor="hand2")
+        if cmd:
+            ch.bind("<Button-1>", lambda e: cmd())
+        return ch
+
+    def _invalidate(self):
+        self.sig = None
+
+    def load(self):
+        self.sub.configure(text="channels load ho rahi hain…")
+        self.pool.submit(self._load_work)
+
+    def _load_work(self):
+        chans = _live_fetch_server(self.server)
+        def done():
+            self.chans = chans
+            self.sub.configure(text=f"{len(chans)} channels")
+            self._cats()
+            self.sig = None
+        try:
+            self.win.after(0, done)
+        except Exception:
+            pass
+
+    def _cats(self):
+        for w in self.chips.winfo_children():
+            if w.cget("text") != "All":
+                w.destroy()
+        cats = {}
+        for c in self.chans:
+            cats[c["cat"]] = cats.get(c["cat"], 0) + 1
+        for name, n in sorted(cats.items(), key=lambda kv: -kv[1])[:9]:
+            ch = self._chip(f"{name} ({n})", lambda nm=name: self._setcat(nm))
+            ch.pack(side="left", padx=(0, 6))
+
+    def _setcat(self, nm):
+        self.cat = nm
+        self.sig = None
+
+    def _server_switch(self, si):
+        self.server = si
+        self.chans = []
+        self.sig = None
+        self.load()
+
+    def visible(self):
+        q = self.q.get().strip().lower()
+        out = []
+        for c in self.chans:
+            if self.cat != "All" and c["cat"] != self.cat:
+                continue
+            if q and q not in c["name"].lower():
+                continue
+            out.append(c)
+        return out
+
+    def _tick(self):
+        try:
+            items = self.visible()
+            sig = (len(items), self.cat, self.q.get().strip().lower(), len(self.chans))
+            if sig != self.sig:
+                self.sig = sig
+                self._rebuild(items)
+        except Exception:
+            pass
+        self.win.after(500, self._tick)
+
+    def _rebuild(self, items):
+        try:
+            frac = self.canvas.yview()[0]
+            for w in self.gridfr.winfo_children():
+                w.destroy()
+            self.cards = {}
+            if not self.chans:
+                tk.Label(self.gridfr, text="channels load ho rahi hain… (net chahiye, 15-20 sec)",
+                         bg=BG, fg=SUB, font=FONT_S).grid(row=0, column=0, padx=10, pady=30)
+                return
+            if not items:
+                tk.Label(self.gridfr, text="is filter me kuch nahi mila", bg=BG, fg=SUB,
+                         font=FONT_S).grid(row=0, column=0, padx=10, pady=30)
+                return
+            for i, ch in enumerate(items[:400]):
+                r, c = divmod(i, self.cols)
+                self.gridfr.columnconfigure(c, weight=1)
+                self.gridfr.rowconfigure(r, weight=0)
+                f = self._card(ch)
+                f.grid(row=r, column=c, padx=5, pady=5, sticky="n")
+        except Exception:
+            pass
+        try:
+            self.canvas.yview_moveto(frac)
+        except Exception:
+            pass
+
+    def _card(self, ch):
+        f = tk.Frame(self.gridfr, bg="#101014", bd=0, highlightthickness=1,
+                     highlightbackground="#23232B", cursor="hand2")
+        f.configure(width=170, height=118)
+        f.pack_propagate(False)
+        img_l = tk.Label(f, bg="#0A0A0C", width=23, height=4)
+        img_l.pack(fill="both", expand=True, padx=6, pady=(6, 0))
+        nm = ch["name"][:26]
+        tag = "  ⛔DRM" if ch["drm"] else ""
+        tk.Label(f, text=nm + tag, bg="#101014", fg=(SUB if ch["drm"] else TXT),
+                 font=("Segoe UI", 9, "bold"), wraplength=160).pack(fill="x", padx=6, pady=(2, 5))
+        def go(e):
+            if ch["drm"]:
+                self._play_fail_drm(ch)
+            else:
+                PlayerWin(self.win, ch["url"], title=ch["name"], headers=ch["hdrs"], live=True)
+        def backup(e):
+            if ch["backup"]:
+                PlayerWin(self.win, ch["backup"], title=ch["name"] + " (backup)",
+                          headers=ch["hdrs"], live=True)
+        def link(e):
+            self.win.clipboard_clear()
+            self.win.clipboard_append(ch["url"])
+        f.bind("<Button-1>", go)
+        img_l.bind("<Button-1>", go)
+        f.bind("<Double-Button-1>", backup)
+        f.bind("<Button-3>", link)
+        if ch["logo"]:
+            self.pool.submit(self._logo_work, ch["logo"], id(f))
+            self.cards[id(f)] = img_l
+            f._img_key = id(f)
+        return f
+
+    def _play_fail_drm(self, ch):
+        from tkinter import messagebox
+        messagebox.showinfo("RC TV", f"\"{ch['name']}\" DRM-protected hai — PC player me nahi chalta.\n"
+                                     "Baaki channels chalega (DRM wale 12% hi hain).", parent=self.win)
+
+    def _logo_work(self, url, key):
+        try:
+            from PIL import Image, ImageTk
+            import io
+            req = urllib.request.Request(url, headers={"User-Agent": UA_LIVE})
+            data = urllib.request.urlopen(req, timeout=10).read()
+            im = Image.open(io.BytesIO(data)).convert("RGBA")
+            im.thumbnail((110, 64))
+            def done():
+                lbl = self.cards.get(key)
+                if lbl and lbl.winfo_exists():
+                    ph = ImageTk.PhotoImage(im)
+                    self.logos[key] = ph
+                    lbl.configure(image=ph, width=110, height=64)
+            self.win.after(0, done)
+        except Exception:
+            pass
+
+
 def main():
     global LOOP
     if "--headless" in sys.argv or tk is None:
@@ -1484,7 +2141,26 @@ def main():
 
     threading.Thread(target=_run_core, daemon=True).start()
     root = tk.Tk()
-    App(root)
+    app = App(root)
+
+    # --autotest: 18s baad player+livewin khol ke log likhwa do (wine/CI verify)
+    if "--autotest" in sys.argv:
+        def _at():
+            try:
+                vids = [i for i in list(index.values()) if i.get("kind") == "video"]
+                if vids:
+                    PlayerWin(root, f"{base_url()}/f/{vids[0]['id']}", title="autotest")
+                    log("AUTOTEST: player open ho gaya")
+                else:
+                    log("AUTOTEST: index khali (video nahi aaya)")
+                lw = LiveWin(root)
+                log("AUTOTEST: livewin open ho gaya")
+                root.after(45000, lambda: log("AUTOTEST-DONE"))
+            except Exception as e:
+                log("AUTOTEST-ERR: " + repr(e))
+                root.after(1000, lambda: log("AUTOTEST-DONE"))
+        root.after(18000, _at)
+
     root.mainloop()
 
 
