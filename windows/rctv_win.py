@@ -12,7 +12,7 @@
 import asyncio, base64, json, os, random, re, shutil, socket, subprocess, sys, threading, time, traceback, webbrowser
 from pathlib import Path
 
-VERSION = "1.0"
+VERSION = "1.1"
 
 # ---------------- config ----------------
 
@@ -36,7 +36,24 @@ def app_dir():
     return Path(__file__).parent
 
 
-HOME = rctv_home()
+def _pick_home():
+    # Pehla writable folder chuno — APPDATA ke permission/roaming issues par
+    # exe ke bagal wala folder, phir temp. (v1.0 ka crash yahi tha: RCTV folder
+    # banta hi nahi tha, isliye sqlite "unable to open database file" bol raha tha.)
+    import tempfile
+    for h in (rctv_home(), app_dir() / "RCTV-data", Path(tempfile.gettempdir()) / "RCTV"):
+        try:
+            h.mkdir(parents=True, exist_ok=True)
+            t = h / ".w"
+            t.write_text("ok")
+            t.unlink()
+            return h
+        except Exception:
+            continue
+    raise RuntimeError("koi writable data folder nahi mila")
+
+
+HOME = _pick_home()
 
 
 def load_config():
@@ -940,15 +957,42 @@ def _core_loop():
         time.sleep(5)  # net gaya to dobara try
 
 
-# ---------------- GUI (tkinter — Python ke saath hi aata hai) ----------------
+# ---------------- GUI (TV app jaisa — dark theme + poster grid) ----------------
 
 try:
     import tkinter as tk
-    from tkinter import ttk
-except Exception:  # headless / GUI-less par bhi core chale
+except Exception:  # GUI-less par bhi core chale
     tk = None
 
+try:
+    import io
+    from PIL import Image, ImageTk, ImageDraw
+except Exception:
+    Image = ImageTk = ImageDraw = None
+
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
 LOOP = None  # core thread ka asyncio loop
+
+# TV app ki palette (app/src/main/res/values/colors.xml jaisi hi)
+BG = "#050507"
+CARD = "#141419"
+GLASS = "#1B1B22"
+GLASS2 = "#26262E"
+ACC = "#FA2D48"
+ACC2 = "#FF6B80"
+SUB = "#A1A1A8"
+TXT = "#FFFFFF"
+
+IMG_W, IMG_H = 160, 90
+CARD_W = IMG_W + 14
+FONT = ("Segoe UI", 9)
+FONT_B = ("Segoe UI", 9, "bold")
+FONT_S = ("Segoe UI", 8)
+FONT_H = ("Segoe UI", 17, "bold")
+KIND_TILE = {"video": ("#1B2434", "VIDEO"), "audio": ("#241B2E", "MUSIC"),
+             "photo": ("#1B2E24", "PHOTO"), "sub": ("#222226", "SUBS")}
 
 
 def post(fn):
@@ -1030,88 +1074,288 @@ def icon_path():
     return None
 
 
-class GUI:
+def ext_of(it):
+    fn = it.get("fileName") or ""
+    if "." in fn:
+        return fn.rsplit(".", 1)[-1].upper()[:6]
+    return (it.get("mime") or "").split("/")[-1].upper()[:6] or "?"
+
+
+class App:
     def __init__(self, root):
         self.root = root
         root.title(f"RC TV — Windows v{VERSION}")
-        root.geometry("860x560")
-        root.minsize(680, 420)
+        root.configure(bg=BG)
         try:
-            ip = icon_path()
-            if ip:
+            root.state("zoomed")  # TV app jaisa full window
+        except Exception:
+            root.geometry("1020x660")
+        root.minsize(720, 460)
+        ip = icon_path()
+        if ip:
+            try:
                 root.iconbitmap(ip)
+            except Exception:
+                pass
+
+        self.filter = "all"
+        self.qvar = tk.StringVar()
+        self.thumbs = {}      # mid -> PhotoImage (ref rakhna zaroori)
+        self.thumb_real = set()  # jinke asli thumb aa chuke (placeholder nahi)
+        self.pending = set()  # thumb fetch chal raha hai
+        self.pool = ThreadPoolExecutor(max_workers=6)
+        self.cards = {}       # mid -> img Label (thumb baad me update karne ke liye)
+        self.sig = None
+        self.cols = 1
+
+        self._topbar(root)
+        self.banner = tk.Label(root, text="", bg="#3A0D14", fg=ACC2, font=FONT_S,
+                               anchor="w", padx=10, pady=3)
+        self.banner_visible = False
+        self._chipsbar(root)   # chips grid se PEHLE pack ho (warna neeche chale jate hain)
+        self._grid(root)
+        self._statusbar(root)
+
+        globals()["_LOG_UI"] = self.ui_log
+        root.after(700, self.poll)
+
+    # ---- log: app.log me (GUI par logbox nahi — TV app jaisa saaf look) ----
+    def ui_log(self, line):
+        try:
+            f = HOME / "app.log"
+            if f.exists() and f.stat().st_size > 1_000_000:
+                data = f.read_text(errors="ignore")[-200_000:]
+                f.write_text(data)
+            with open(f, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
         except Exception:
             pass
 
-        top = ttk.Frame(root, padding=6)
-        top.pack(fill="x")
-        self.b_scan = ttk.Button(top, text="Rescan", command=self.do_scan)
-        self.b_scan.pack(side="left")
-        self.b_play = ttk.Button(top, text="▶ Play", command=self.do_play)
-        self.b_play.pack(side="left", padx=4)
-        ttk.Button(top, text="Copy link", command=self.do_copy).pack(side="left")
-        ttk.Button(top, text="Web UI", command=lambda: webbrowser.open(base_url() + "/")).pack(side="left", padx=4)
-        ttk.Button(top, text="Fix now", command=self.do_fix).pack(side="left")
-        self.auto = tk.BooleanVar(value=bool(SETTINGS.get("auto_heal")))
-        ttk.Checkbutton(top, text="Auto-fix door DC", variable=self.auto,
-                        command=self.toggle_auto).pack(side="left", padx=8)
-        ttk.Button(top, text="About", command=self.about).pack(side="right")
+    # ---------- layout ----------
+    def _topbar(self, root):
+        bar = tk.Frame(root, bg=BG)
+        bar.pack(fill="x", padx=16, pady=(10, 2))
+        tk.Label(bar, text="RC TV", bg=BG, fg=ACC, font=FONT_H).pack(side="left")
+        self.h_title = tk.Label(bar, text="", bg=BG, fg=TXT, font=("Segoe UI", 11, "bold"))
+        self.h_title.pack(side="left", padx=(12, 0))
+        self.h_sub = tk.Label(bar, text="", bg=BG, fg=SUB, font=FONT_S)
+        self.h_sub.pack(side="left", padx=(12, 0))
+        self._chip(bar, "Rescan", self.do_scan).pack(side="right", padx=(8, 0))
+        self._chip(bar, "Web UI", lambda: webbrowser.open(base_url() + "/")).pack(side="right", padx=(8, 0))
+        self._chip(bar, "About", self.about).pack(side="right")
 
-        self.status = tk.StringVar(value="Shuru ho raha hai…")
-        ttk.Label(root, textvariable=self.status, padding=(8, 2), wraplength=840).pack(fill="x")
+    def _chipsbar(self, root):
+        row = tk.Frame(root, bg=BG)
+        row.pack(fill="x", padx=16, pady=(4, 6))
+        self.chips = {}
+        for key, label in (("all", "Sab"), ("video", "Videos"), ("audio", "Music"), ("photo", "Photos")):
+            c = self._chip(row, label, lambda k=key: self.set_filter(k), key=key, small=True)
+            c.pack(side="left", padx=(0, 6))
+            self.chips[key] = c
+        tk.Label(row, text="Search", bg=BG, fg=SUB, font=FONT_S).pack(side="right", padx=(8, 4))
+        ent = tk.Entry(row, textvariable=self.qvar, bg=GLASS, fg=TXT, insertbackground=TXT,
+                       relief="flat", width=26, font=FONT)
+        ent.pack(side="right")
+        ent.bind("<KeyRelease>", lambda e: self.refresh())
 
-        cols = ("title", "size", "kind", "dc", "status")
-        self.tree = ttk.Treeview(root, columns=cols, show="headings", selectmode="browse")
-        for c, w, a in (("title", 380, "w"), ("size", 80, "e"), ("kind", 60, "center"),
-                        ("dc", 50, "center"), ("status", 150, "w")):
-            self.tree.heading(c, text=c.capitalize())
-            self.tree.column(c, width=w, anchor=a)
-        self.tree.pack(fill="both", expand=True, padx=6)
-        self.tree.bind("<Double-1>", lambda e: self.do_play())
-        self.menu = tk.Menu(root, tearoff=0)
-        for lbl, fn in (("▶ Play", self.do_play), ("Copy link", self.do_copy),
-                        ("Fix now (re-upload)", self.do_fix)):
-            self.menu.add_command(label=lbl, command=fn)
-        self.tree.bind("<Button-3>", self.on_right)
+    def _chip(self, parent, text, cmd, key=None, small=False):
+        active = key is not None and key == self.filter
+        c = tk.Label(parent, text=text, bg=(ACC if active else GLASS), fg=TXT,
+                     font=FONT_S if small else FONT, padx=12, pady=4, cursor="hand2")
+        c.bind("<Button-1>", lambda e: cmd())
+        c.bind("<Enter>", lambda e: c.configure(bg=GLASS2))
+        c.bind("<Leave>", lambda e: c.configure(bg=(ACC if (key is not None and key == self.filter) else GLASS)))
+        return c
 
-        self.logbox = tk.Text(root, height=7, state="disabled", font=("Consolas", 9))
-        self.logbox.pack(fill="x", padx=6, pady=(2, 6))
-        globals()["_LOG_UI"] = self.ui_log
+    def set_filter(self, k):
+        self.filter = k
+        for key, w in self.chips.items():
+            w.configure(bg=(ACC if key == k else GLASS))
+        self.refresh()
 
-        self.last_sig = None
-        self.poll()
+    def _grid(self, root):
+        wrap = tk.Frame(root, bg=BG)
+        wrap.pack(fill="both", expand=True)
+        self.wrap = wrap
+        self.canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0)
+        self.sb = tk.Scrollbar(wrap, orient="vertical", command=self.canvas.yview,
+                               bg=GLASS, troughcolor=BG, activebackground=GLASS2,
+                               width=12)
+        self.canvas.configure(yscrollcommand=self.sb.set)
+        self.sb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.gridfr = tk.Frame(self.canvas, bg=BG)
+        self._gwin = self.canvas.create_window((12, 8), window=self.gridfr, anchor="nw")
+        self.gridfr.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", self.on_resize)
+        self.canvas.bind_all("<MouseWheel>", self.on_wheel)
+        self.canvas.bind_all("<Button-4>", lambda e: self.canvas.yview_scroll(-3, "units"))
+        self.canvas.bind_all("<Button-5>", lambda e: self.canvas.yview_scroll(3, "units"))
+        self.empty = tk.Label(root, text="", bg=BG, fg=SUB, font=("Segoe UI", 12), anchor="center")
+        self.menu = tk.Menu(self.canvas, tearoff=0, bg=GLASS, fg=TXT, bd=0,
+                            activebackground=ACC, activeforeground=TXT,
+                            font=FONT_S)
+        self.menu.add_command(label="Play / Open", command=lambda: self.open_item(self.menu_mid, self.menu_kind))
+        self.menu.add_command(label="Copy link", command=lambda: self.copy_link(self.menu_mid))
+        self.menu.add_command(label="Fix now (re-upload)", command=lambda: self.fix_now(self.menu_mid))
+        self.menu_mid = 0
+        self.menu_kind = "video"
 
-    # ---- log ----
-    def ui_log(self, line):
-        self.logbox.configure(state="normal")
-        self.logbox.insert("end", line + "\n")
-        self.logbox.see("end")
-        if float(self.logbox.index("end-1c").split(".")[0]) > 400:
-            self.logbox.delete("1.0", "50.0")
-        self.logbox.configure(state="disabled")
+    def _statusbar(self, root):
+        self.status = tk.Label(root, text="Shuru ho raha hai…", bg=GLASS, fg=SUB,
+                               font=FONT_S, anchor="w", padx=10, pady=4)
+        self.status.pack(fill="x", side="bottom")
 
-    # ---- actions ----
-    def _sel(self):
-        s = self.tree.selection()
-        return int(s[0]) if s else None
+    def on_resize(self, e):
+        try:
+            self.canvas.itemconfigure(self._gwin, width=max(200, e.width - 24))
+        except Exception:
+            pass
+        cols = max(1, (e.width - 24) // (CARD_W + 10))
+        if cols != self.cols:
+            self.cols = cols
+            self.rebuild()
 
-    def do_scan(self):
-        post(scan())
+    def on_wheel(self, e):
+        try:
+            self.canvas.yview_scroll(-1 * (int(e.delta) // 120) * 4, "units")
+        except Exception:
+            pass
 
-    def do_play(self):
-        mid = self._sel()
-        if mid:
-            play_url(f"{base_url()}/f/{mid}")
+    # ---------- data ----------
+    def visible(self):
+        its = [i for i in index.values() if i.get("kind") != "sub"]
+        if self.filter != "all":
+            its = [i for i in its if i["kind"] == self.filter]
+        q = self.qvar.get().strip().lower()
+        if q:
+            its = [i for i in its if q in (i["title"] or "").lower()
+                   or q in (i.get("fileName") or "").lower()]
+        return sorted(its, key=lambda x: x["id"], reverse=True)
 
-    def do_copy(self):
-        mid = self._sel()
+    def row_status(self, it):
+        mid = it["id"]
+        hs = heal_state.get(mid)
+        if hs:
+            st = hs.get("status")
+            if st == "queued":
+                return "Fix queued…"
+            if st == "running":
+                return f"Fixing {hs.get('pct', 0)}%"
+            if st == "done":
+                return "Fixed"
+            if st == "failed":
+                return "Fix fail"
+        if it.get("big"):
+            return "2GB+ (bot limit)"
+        if (it.get("dc") or 0) in FAR_DCS:
+            return "Door DC — fix hoga" if SETTINGS.get("auto_heal") else "Door DC"
+        return ""
+
+    def card(self, parent, it):
+        mid = it["id"]
+        f = tk.Frame(parent, bg=CARD, highlightthickness=1, highlightbackground=GLASS, cursor="hand2")
+        img = tk.Label(f, bg=CARD, image=self.thumbs.get(mid) or self._tile(mid, it))
+        img.pack(padx=2, pady=2)
+        self.cards[mid] = img
+        tk.Label(f, text=it["title"], bg=CARD, fg=TXT, font=FONT_B, wraplength=IMG_W,
+                 justify="left").pack(padx=5, pady=(2, 0))
+        st = self.row_status(it)
+        meta = f"{human(it.get('size'))} · {ext_of(it)}"
+        if st:
+            meta += " · " + st
+        hot = ("Fix" in st or "Door" in st or "2GB" in st) if st else False
+        tk.Label(f, text=meta, bg=CARD, fg=(ACC2 if hot else SUB), font=FONT_S,
+                 wraplength=IMG_W, justify="left").pack(padx=5, pady=(1, 5))
+        f.bind("<Button-1>", lambda e, m=mid, k=it["kind"]: self.open_item(m, k))
+        f.bind("<Button-3>", lambda e, m=mid, k=it["kind"]: self.popup(e, m, k))
+        f.bind("<Enter>", lambda e: f.configure(highlightthickness=2, highlightbackground=ACC))
+        f.bind("<Leave>", lambda e: f.configure(highlightthickness=1, highlightbackground=GLASS))
+        return f
+
+    # ---------- thumbnails (apne hi server ke /t/{id} se, disk cache) ----------
+    def _tile(self, mid, it):
+        col, word = KIND_TILE.get(it["kind"], ("#1C1C22", "FILE"))
+        if Image and ImageTk and ImageDraw:
+            im = Image.new("RGB", (IMG_W, IMG_H), col)
+            d = ImageDraw.Draw(im)
+            d.text((IMG_W // 2 - len(word) * 3, IMG_H // 2 - 5), word, fill="#5A5A64")
+            ph = ImageTk.PhotoImage(im)
+        else:
+            ph = tk.PhotoImage(width=IMG_W, height=IMG_H)
+            ph.put(col, to=(0, 0, IMG_W, IMG_H))
+        self.thumbs[mid] = ph
+        return ph
+
+    def want_thumb(self, mid):
+        if Image is None or ImageTk is None:
+            return
+        if mid in self.pending or mid in self.thumb_real:
+            return
+        self.pending.add(mid)
+        self.pool.submit(self._fetch_thumb, mid)
+
+    def _fetch_thumb(self, mid):
+        img = None
+        try:
+            cache = HOME / "thumbs"
+            cache.mkdir(parents=True, exist_ok=True)
+            cf = cache / f"{mid}.jpg"
+            if cf.exists() and cf.stat().st_size > 100:
+                img = Image.open(cf)
+            else:
+                data = urllib.request.urlopen(f"{base_url()}/t/{mid}", timeout=25).read()
+                cf.write_bytes(data)
+                img = Image.open(io.BytesIO(data))
+        except Exception:
+            img = None
+        try:
+            if img is not None:
+                im = img.convert("RGB")
+                im.thumbnail((IMG_W, IMG_H))
+                tile = Image.new("RGB", (IMG_W, IMG_H), CARD)
+                tile.paste(im, ((IMG_W - im.width) // 2, (IMG_H - im.height) // 2))
+                self.root.after(0, self._thumb_done, mid, tile)
+                return
+        except Exception:
+            pass
+        self.root.after(0, self._thumb_done, mid, None)
+
+    def _thumb_done(self, mid, tile):
+        self.pending.discard(mid)
+        if tile is None:
+            return  # thumb nahi mili — placeholder tile chalega
+        try:
+            ph = ImageTk.PhotoImage(tile)
+        except Exception:
+            return
+        self.thumbs[mid] = ph
+        self.thumb_real.add(mid)
+        lab = self.cards.get(mid)
+        if lab:
+            try:
+                if lab.winfo_exists():
+                    lab.configure(image=ph)
+            except Exception:
+                pass
+
+    # ---------- actions ----------
+    def open_item(self, mid, kind):
+        url = f"{base_url()}/f/{mid}"
+        if kind in ("video", "audio"):
+            play_url(url)
+        else:  # photo/sub — browser/viewer
+            try:
+                os.startfile(url)
+            except Exception:
+                webbrowser.open(url)
+
+    def copy_link(self, mid):
         if mid:
             self.root.clipboard_clear()
             self.root.clipboard_append(f"{base_url()}/f/{mid}")
-            self.ui_log("Link copy ho gaya: " + f"{base_url()}/f/{mid}")
 
-    def do_fix(self):
-        mid = self._sel()
+    def fix_now(self, mid):
         if not mid:
             return
 
@@ -1122,83 +1366,100 @@ class GUI:
                 queue_heal(mid, m.document, force=True)
         post(_fix())
 
-    def toggle_auto(self):
-        SETTINGS["auto_heal"] = bool(self.auto.get())
-        save_settings()
-        log("Auto-fix door DC: " + ("ON" if SETTINGS["auto_heal"] else "OFF"))
+    def do_scan(self):
+        post(scan())
 
-    def on_right(self, e):
-        iid = self.tree.identify_row(e.y)
-        if iid:
-            self.tree.selection_set(iid)
+    def popup(self, e, mid, kind):
+        self.menu_mid, self.menu_kind = mid, kind
+        try:
             self.menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            self.menu.grab_release()
 
     def about(self):
         from tkinter import messagebox
-        messagebox.showinfo("RC TV", f"RC TV — Windows v{VERSION}\n\n"
-                            f"Bot: @{(CFG['BOT_TOKEN'].split(':')[1][:1] + '…') if CFG['BOT_TOKEN'] else '—'} · "
-                            f"Storage: {state['title'] or CFG['GROUP_ID']}\n"
-                            f"Data folder: {HOME}\n\n"
-                            f"Isi PC: {base_url()}/\nTV / phone (same WiFi): http://{state['lan']}:{CFG['PORT']}/\n\n"
-                            f"TV app me Settings > Server me upar wala TV/phone URL dalo.\n"
-                            f"Telegram DM me bot ko /status ya /scan bhejo.")
+        messagebox.showinfo(
+            "RC TV", f"RC TV — Windows v{VERSION}\n"
+            f"Storage: {state['title'] or CFG['GROUP_ID']} · Data: {HOME}\n\n"
+            f"Isi PC: {base_url()}/\n"
+            f"TV/phone (same WiFi): http://{state['lan'] or lan_ip()}:{CFG['PORT']}/\n\n"
+            f"TV app > Settings > Server me upar wala URL dalo to TV bhi isi PC se chalega.\n"
+            f"Card par click = play · right-click = menu · door-DC video khud fix hoti hai.")
 
-    # ---- 1 sec poll: status + list refresh ----
-    def row_status(self, it):
-        mid = it["id"]
-        hs = heal_state.get(mid)
-        if hs:
-            st = hs.get("status")
-            if st == "queued":
-                return "Fix queued…"
-            if st == "running":
-                return f"Fixing… {hs.get('pct', 0)}%"
-            if st == "done":
-                return "Fixed ✓"
-            if st == "failed":
-                return "Fix fail ⚠ " + (hs.get("err") or "")[:24]
-        if it.get("big"):
-            return "2GB+ (bot limit)"
-        dc = it.get("dc") or 0
-        if dc in FAR_DCS:
-            return "Door DC — fix hoga" if SETTINGS.get("auto_heal") else "Door DC ⚠"
-        return "OK"
+    def refresh(self):
+        self.sig = None  # force rebuild
+        self.poll()
+
+    # ---------- 1-sec poll ----------
+    def update_header(self):
+        tot = sum(i.get("size") or 0 for i in index.values())
+        vids = sum(1 for i in index.values() if i["kind"] == "video")
+        self.h_title.configure(text=state["title"] or "")
+        self.h_sub.configure(text=f"{len(index)} files · {human(tot)} · {vids} videos")
+
+    def update_status(self):
+        bits = []
+        bits.append("Online" if state["online"] else "Connect ho raha hai…")
+        if state["dc"]:
+            bits.append(f"dc{state['dc']}")
+        if state["speed"]:
+            bits.append(f"{state['speed'] / 1e6:.1f} MB/s")
+        if state["scanning"]:
+            bits.append("scanning…")
+        hh = [v for v in heal_state.values() if v.get("status") in ("queued", "running")]
+        if hh:
+            bits.append(f"Heal: {(hh[0].get('name') or 'file')[:28]} {hh[0].get('pct', 0)}%")
+        self.status.configure(text="  ·  ".join(bits) +
+                              f"   |   TV/phone: http://{state['lan'] or lan_ip()}:{CFG['PORT']}/")
 
     def poll(self):
         try:
-            if state["error"]:
-                self.status.set("⚠ " + state["error"])
-            else:
-                bits = []
-                bits.append("● Online" if state["online"] else "○ Connect ho raha hai…")
-                if state["dc"]:
-                    bits.append(f"dc{state['dc']}")
-                if state["title"]:
-                    bits.append(state["title"])
-                bits.append(f"{len(index)} files")
-                if state["speed"]:
-                    bits.append(f"{state['speed'] / 1e6:.1f} MB/s")
-                if state["scanning"]:
-                    bits.append(f"scanning {state['scanned']}…")
-                hh = [v for v in heal_state.values() if v.get("status") in ("queued", "running")]
-                if hh:
-                    bits.append(f"🛠 {hh[0].get('name') or 'file'} {hh[0].get('pct', 0)}%")
-                self.status.set(" · ".join(bits) + f"   |   TV/phone: http://{state['lan'] or lan_ip()}:{CFG['PORT']}/")
+            err = state["error"]
+            if err and not self.banner_visible:
+                self.banner.configure(text="⚠ " + err + "   —   app khud dobara connect karega…")
+                self.banner.pack(fill="x", padx=16, pady=(0, 4), before=self.wrap)
+                self.banner_visible = True
+            elif not err and self.banner_visible:
+                self.banner.pack_forget()
+                self.banner_visible = False
 
-            sig = (state["version"], json.dumps({str(k): v.get("status") for k, v in heal_state.items()}, sort_keys=True))
-            if sig != self.last_sig:
-                self.last_sig = sig
-                sel = self._sel()
-                self.tree.delete(*self.tree.get_children())
-                for it in sorted(index.values(), key=lambda x: x["id"], reverse=True):
-                    self.tree.insert("", "end", iid=str(it["id"]), values=(
-                        it["title"][:70], human(it.get("size")), it["kind"],
-                        f"dc{it['dc']}" if it.get("dc") else "—", self.row_status(it)))
-                if sel and self.tree.exists(str(sel)):
-                    self.tree.selection_set(str(sel))
+            self.update_header()
+            self.update_status()
+
+            heal_sig = tuple(sorted((k, v.get("status"), (v.get("pct") or 0) // 5)
+                                    for k, v in heal_state.items()))
+            sig = (state["version"], self.filter, self.qvar.get().strip().lower(),
+                   heal_sig, len(index), self.cols, state["error"])
+            if sig != self.sig:
+                self.sig = sig
+                self.rebuild()
         except Exception:
             pass
-        self.root.after(1000, self.poll)
+        self.root.after(700, self.poll)
+
+    def rebuild(self):
+        try:
+            frac = self.canvas.yview()[0]
+            for w in self.gridfr.winfo_children():
+                w.destroy()
+            self.cards.clear()
+            items = self.visible()
+            for i, it in enumerate(items):
+                r, c = divmod(i, self.cols)
+                f = self.card(self.gridfr, it)
+                f.grid(row=r, column=c, padx=5, pady=5, sticky="n")
+                self.want_thumb(it["id"])
+            if items:
+                self.empty.pack_forget()
+            else:
+                self.empty.configure(text="Scan ho raha hai…" if state["scanning"] else "Yahan abhi kuch nahi hai")
+                try:
+                    self.empty.pack(fill="x", padx=16, pady=14, before=self.wrap)
+                except Exception:
+                    pass
+            self.canvas.yview_moveto(frac)
+        except Exception:
+            pass
 
 
 def main():
@@ -1223,8 +1484,7 @@ def main():
 
     threading.Thread(target=_run_core, daemon=True).start()
     root = tk.Tk()
-    ttk.Style(root).theme_use("clam")
-    GUI(root)
+    App(root)
     root.mainloop()
 
 
