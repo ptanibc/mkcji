@@ -12,12 +12,12 @@
 import asyncio, base64, json, os, random, re, shutil, socket, subprocess, sys, threading, time, traceback, webbrowser
 from pathlib import Path
 
-VERSION = "1.2"
+VERSION = "1.3"
 
 # ---------------- config ----------------
 
-DEF = {"API_ID": 14116809, "API_HASH": "", "BOT_TOKEN": "", "GROUP_ID": -1003904890252,
-       "ADMIN_ID": 1345802943, "PORT": 8090}
+DEF = {"API_ID": 14116809, "API_HASH": "", "BOT_TOKEN": "", "SESSION": "",
+       "GROUP_ID": -1003904890252, "ADMIN_ID": 1345802943, "PORT": 8090}
 
 
 def rctv_home():
@@ -840,11 +840,20 @@ def lan_ip():
 async def main_async():
     global client, group, BOOT_TS
     BOOT_TS = time.time()
-    if not CFG["API_HASH"] or not CFG["BOT_TOKEN"]:
-        raise RuntimeError("Config missing — .env me API_ID, API_HASH, BOT_TOKEN, GROUP_ID bharo "
-                           "(server/.env.example dekho)")
-    client = TelegramClient(str(HOME / "tvbot.session"), CFG["API_ID"], CFG["API_HASH"])
-    await client.start(bot_token=CFG["BOT_TOKEN"])
+    if not CFG["API_HASH"] or not (CFG["BOT_TOKEN"] or CFG["SESSION"]):
+        raise RuntimeError("Config missing — .env me API_ID, API_HASH, BOT_TOKEN (ya SESSION), "
+                           "GROUP_ID bharo (server/.env.example dekho)")
+    if CFG["SESSION"]:
+        # bot_token + api pair invalid ho sakta hai (ApiIdInvalidError) — seedha authed session
+        from telethon.sessions import StringSession
+        client = TelegramClient(StringSession(CFG["SESSION"]), CFG["API_ID"], CFG["API_HASH"])
+        await client.connect()
+        if not await client.is_user_authorized():
+            raise RuntimeError("SESSION string expire ho gaya — naya session chahiye")
+        log("Session se login (bot_token skip)")
+    else:
+        client = TelegramClient(str(HOME / "tvbot.session"), CFG["API_ID"], CFG["API_HASH"])
+        await client.start(bot_token=CFG["BOT_TOKEN"])
     state["dc"] = client.session.dc_id
 
     real_id, peer_type = utils.resolve_id(CFG["GROUP_ID"])
@@ -1471,11 +1480,14 @@ class App:
 
 
 # ================= in-app playback: mpv (browser/VLC ki zaroorat nahi) =================
-# libmpv-2.dll exe ke bagal me bundled hai — video/audio sab APP KE ANDAR chalta hai.
+# libmpv-2.dll exe ke bagal me bundled hai (baseline x86_64 — har CPU par chalega).
+# Video: mpv ka APNA player window (OSC controls, fullscreen, video khatam = band)
+# Audio: app ke andar chhota mini window. Ek waqt me ek playback (nayi purani ko band karti hai).
 import ctypes
 
 _MPV = None
 _MPV_TRIED = False
+_CUR = None  # abhi chal raha playback (singleton)
 
 
 def _mpv():
@@ -1529,77 +1541,93 @@ def _mmss(t):
 
 
 class PlayerWin:
-    """Ek hi playback = ek chhota mpv instance app ke andar embed.
-    Keys: Space=pause · <-/-> seek ±10s · Up/Down volume · F/double-click fullscreen · M mute · Esc/q band."""
+    """Ek playback = ek mpv instance.
+    Video/Live: mpv ka apna window — seek bar, pause, fullscreen (F/double-click),
+    q/Esc band, video khatam hone par khud band (TV player jaisa).
+    Audio: app ke andar mini window (Esc band · Space pause · Up/Down volume).
+    Nayi playback purani ko band kar deti hai — window stack nahi banta."""
 
     def __init__(self, master, url, title="", headers=None, audio=False, live=False):
+        global _CUR
         self.url = url
         self.title = title or "RC TV"
         self.live = live
         self.audio = audio
-        self.full = False
         self.h = None
         self.dead = False
-        w, hgt = (520, 120) if audio else (960, 560)
-        self.win = tk.Toplevel(master)
-        self.win.title(("LIVE  ▶  " if live else "▶  ") + self.title)
-        self.win.configure(bg="#000000")
-        self.win.geometry(f"{w}x{hgt}" if not audio else f"{w}x{hgt}")
-        self.win.protocol("WM_DELETE_WINDOW", self.close)
-
-        self.frame = tk.Frame(self.win, bg="#000000")
-        self.frame.pack(fill="both", expand=True)
+        self.played = False
+        self.eof = False
+        if _CUR is not None:
+            try:
+                _CUR.terminate()
+            except Exception:
+                pass
+        _CUR = self
         if audio:
-            tk.Label(self.frame, text="♪  " + self.title, bg="#000000", fg=ACC2,
-                     font=("Segoe UI", 13, "bold"), wraplength=480).pack(expand=True)
-        self.stat = tk.Label(self.win, text="player start ho raha hai…", bg="#0A0A0C",
-                             fg=SUB, font=("Segoe UI", 9), anchor="w")
-        self.stat.pack(fill="x")
+            self._mini_window(master)
+        self._start(headers)
+        threading.Thread(target=self._watch, daemon=True).start()
 
+    # ---- audio ka mini window (video me tk window nahi — mpv apna banata hai) ----
+    def _mini_window(self, master):
+        self.win = tk.Toplevel(master)
+        self.win.title("♪  " + self.title)
+        self.win.configure(bg="#000000")
+        self.win.geometry("520x110")
+        self.win.resizable(False, False)
+        tk.Label(self.win, text="♪  " + self.title, bg="#000000", fg=ACC2,
+                 font=("Segoe UI", 12, "bold"), wraplength=500).pack(expand=True, fill="both")
+        self.stat = tk.Label(self.win, text="Esc = band · Space = pause · Up/Down volume",
+                             bg="#0A0A0C", fg=SUB, font=("Segoe UI", 9))
+        self.stat.pack(fill="x")
         for seq in ("<Escape>", "<q>"):
             self.win.bind(seq, lambda e: self.close())
-        for seq in ("<space>", "<f>", "<m>", "<Left>", "<Right>", "<Up>", "<Down>",
-                   "<Double-Button-1>", "<MouseWheel>"):
+        for seq in ("<space>", "<m>", "<Up>", "<Down>"):
             self.win.bind(seq, self._key)
-        self.frame.bind("<Double-Button-1>", self._key)
-        self.frame.bind("<MouseWheel>", self._key)
-
-        self._start(headers)
-        self.win.after(600, self._tick)
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
 
     # ---- mpv boot ----
     def _start(self, headers):
         m = _mpv()
         if not m:
-            self.stat.configure(text="⚠ player (libmpv-2.dll) load nahi hua — app dobara install karo")
+            msg = "⚠ player (libmpv-2.dll) load nahi hua — exe ke bagal me dll honi chahiye"
+            if self.audio:
+                self.stat.configure(text=msg)
+            else:
+                try:
+                    from tkinter import messagebox
+                    messagebox.showerror("RC TV", msg + "\nApp dobara install karo.")
+                except Exception:
+                    pass
             return
         try:
-            self.frame.update_idletasks()
-            self.win.update()
             h = ctypes.c_void_p(m.mpv_create())
             if not h:
                 raise RuntimeError("mpv_create null")
             _o = lambda k, v: m.mpv_set_option_string(h, k.encode(), str(v).encode())
-            _o("wid", self.frame.winfo_id()) if not self.audio else None
-            if self.audio:
-                _o("vo", "null")          # audio: sirf chhota window, koi video layer nahi
-                _o("force-window", "no")
+            if not self.audio:
+                _o("force-window", "yes")            # mpv apna video window banata hai
+                _o("vo", "gpu,gdi")                   # gpu nahi to software render
+                _o("hwdec", "auto-safe")
+                _o("osc", "yes")                      # seek bar / play / fullscreen controls
+                _o("input-default-bindings", "yes")   # mpv ke saare player keys (q/Esc/f/space/arrows)
+                _o("input-vo-keyboard", "yes")
+                _o("keep-open", "no")                 # video khatam = window band (TV jaisa)
             else:
-                _o("vo", "gpu,gdi")        # gpu nahi to software
-                _o("force-window", "yes")
-            _o("hwdec", "auto-safe")
-            _o("osc", "no")                # control sab app ke pass — mpv apna UI nahi banata
-            _o("input-default-bindings", "no")
-            _o("input-vo-keyboard", "no")
-            _o("keep-open", "always")
-            _o("idle", "yes")
+                _o("vo", "null")                      # audio: koi video layer nahi
+                _o("force-window", "no")
+            _o("title", self.title)
             _o("cache", "yes")
             _o("demuxer-max-bytes", "128MiB")
             _o("demuxer-readahead-secs", "20")
             _o("volume", "100")
             _o("audio-display", "no")
+            _o("osd-playing-msg", self.title[:60])
             if self.live:
                 _o("demuxer-lavf-o", "live=1")
+            if "--autotest" in sys.argv:
+                _o("ao", "null")        # wine/sandbox me audio device nahi
+                _o("untimed", "yes")    # playback instant-complete (eof proof)
             hdrs = []
             for k, v in (headers or {}).items():
                 hdrs.append(f"{k.capitalize()}: {str(v).replace(',', '')}")
@@ -1613,16 +1641,26 @@ class PlayerWin:
             argv = (ctypes.c_char_p * 3)(b"loadfile", self.url.encode(), None)
             if m.mpv_command(h, argv) != 0:
                 raise RuntimeError("loadfile fail")
-            log(f"player: loadfile {self.title[:40]} live={self.live}")
+            log(f"player: loadfile {self.title[:40]} audio={self.audio} live={self.live}")
         except Exception as e:
-            self.stat.configure(text="⚠ player error: " + str(e)[:120])
             log("player error: " + repr(e))
+            if self.audio:
+                self.stat.configure(text="⚠ player error: " + str(e)[:120])
+            else:
+                try:
+                    from tkinter import messagebox
+                    messagebox.showerror("RC TV", "Ye file chal nahi payi: " + str(e)[:120])
+                except Exception:
+                    pass
 
     def _prop(self, name):
-        if not self.h:
+        if not self.h or self.dead:
             return None
         m = _MPV
-        v = m.mpv_get_property_string(self.h, name.encode())
+        try:
+            v = m.mpv_get_property_string(self.h, name.encode())
+        except Exception:
+            return None
         if not v:
             return None
         s = v.decode(errors="ignore")
@@ -1630,19 +1668,25 @@ class PlayerWin:
         return s
 
     def _cmd(self, *args):
-        if not self.h:
+        if not self.h or self.dead:
             return
         argv = (ctypes.c_char_p * (len(args) + 1))(*[a.encode() for a in args], None)
-        _MPV.mpv_command(self.h, argv)
+        try:
+            _MPV.mpv_command(self.h, argv)
+        except Exception:
+            pass
 
     def _setp(self, name, val):
-        if self.h:
-            _MPV.mpv_set_property_string(self.h, name.encode(), str(val).encode())
+        if self.h and not self.dead:
+            try:
+                _MPV.mpv_set_property_string(self.h, name.encode(), str(val).encode())
+            except Exception:
+                pass
 
-    # ---- keys ----
+    # ---- audio mini-window keys ----
     def _key(self, e):
         k = getattr(e, "keysym", "")
-        if k == "Escape" or k == "q":
+        if k in ("Escape", "q"):
             self.close()
         elif k == "space":
             p = self._prop("pause")
@@ -1650,65 +1694,57 @@ class PlayerWin:
         elif k == "m":
             p = self._prop("mute")
             self._setp("mute", "no" if p == "yes" else "yes")
-        elif k == "f" or k == "Double-Button-1":
-            self.full = not self.full
+        elif k == "Up":
             try:
-                self.win.attributes("-fullscreen", self.full)
+                self._setp("volume", min(130, int(float(self._prop("volume") or 100) + 8)))
             except Exception:
                 pass
-        elif k == "Left" and not self.live:
-            self._cmd("seek", "-10")
-        elif k == "Right" and not self.live:
-            self._cmd("seek", "10")
-        elif k == "Up":
-            self._setp("volume", min(130, int(float(self._prop("volume") or 100) + 8)))
         elif k == "Down":
-            self._setp("volume", max(0, int(float(self._prop("volume") or 100) - 8)))
-        elif k == "MouseWheel" and not self.live:
-            d = -1 if getattr(e, "delta", 0) > 0 else 1
-            self._cmd("seek", str(15 * d))
+            try:
+                self._setp("volume", max(0, int(float(self._prop("volume") or 100) - 8)))
+            except Exception:
+                pass
         return "break"
 
-    # ---- 600ms poll: progress title + eof ----
-    def _tick(self):
-        if self.dead:
-            return
-        try:
-            if self.h:
-                dur = self._prop("duration")
+    # ---- background watcher: played marker + eof cleanup ----
+    def _watch(self):
+        while not self.dead:
+            time.sleep(1)
+            if self.dead or not self.h:
+                return
+            try:
                 pos = self._prop("time-pos")
-                paused = self._prop("pause") == "yes"
-                speed = self._prop("speed")
-                if self.live:
-                    self.win.title("LIVE  ▶  " + self.title)
-                elif dur:
-                    self.win.title(f"{'⏸' if paused else '▶'}  {self.title}  "
-                                   f"—  {_mmss(pos)} / {_mmss(dur)}")
-                    self.stat.configure(text=f"{_mmss(pos)} / {_mmss(dur)}  "
-                                             f"(Esc band · Space pause · ←→ seek · F fullscreen)")
-                else:
-                    self.stat.configure(text="buffer ho raha hai…" if not paused else "paused")
-            eof = self._prop("eof-reached")
-            if eof == "True" and not self.live:
-                self.stat.configure(text="✓ khatam — Esc dabao ya band kar do")
-        except Exception:
-            pass
-        self.win.after(600, self._tick)
+                if pos:
+                    self.played = True
+                if self._prop("eof-reached") == "True":
+                    self.eof = True
+                    log(f"player: eof {self.title[:30]}")
+                    self.terminate()
+                    return
+            except Exception:
+                return
 
     def close(self):
+        self.terminate()
+
+    def terminate(self):
+        global _CUR
         if self.dead:
             return
         self.dead = True
+        if _CUR is self:
+            _CUR = None
         try:
             if self.h:
                 _MPV.mpv_terminate_destroy(self.h)
                 self.h = None
         except Exception:
             pass
-        try:
-            self.win.destroy()
-        except Exception:
-            pass
+        if self.audio:
+            try:
+                self.win.destroy()
+            except Exception:
+                pass
 
 
 # ---- photos: PIL viewer (app ke andar, browser nahi) ----
@@ -2149,13 +2185,30 @@ def main():
             try:
                 vids = [i for i in list(index.values()) if i.get("kind") == "video"]
                 if vids:
-                    PlayerWin(root, f"{base_url()}/f/{vids[0]['id']}", title="autotest")
+                    pw = PlayerWin(root, f"{base_url()}/f/{vids[0]['id']}", title="autotest")
                     log("AUTOTEST: player open ho gaya")
+
+                    def _chk(i=0):
+                        try:
+                            if pw.played or pw.eof:
+                                log(f"AUTOTEST-PLAYING (played={pw.played} eof={pw.eof})")
+                            elif i > 25:
+                                log("AUTOTEST-NOSTART (25s me playback start nahi hua)")
+                            else:
+                                root.after(1000, lambda: _chk(i + 1))
+                                return
+                        except Exception as e:
+                            log("AUTOTEST-ERR chk: " + repr(e))
+                            return
+                        lw = LiveWin(root)
+                        log("AUTOTEST: livewin open ho gaya")
+                        root.after(40000, lambda: log("AUTOTEST-DONE"))
+                    root.after(2000, _chk)
                 else:
                     log("AUTOTEST: index khali (video nahi aaya)")
-                lw = LiveWin(root)
-                log("AUTOTEST: livewin open ho gaya")
-                root.after(45000, lambda: log("AUTOTEST-DONE"))
+                    lw = LiveWin(root)
+                    log("AUTOTEST: livewin open ho gaya")
+                    root.after(40000, lambda: log("AUTOTEST-DONE"))
             except Exception as e:
                 log("AUTOTEST-ERR: " + repr(e))
                 root.after(1000, lambda: log("AUTOTEST-DONE"))
