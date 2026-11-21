@@ -12,7 +12,7 @@
 import asyncio, base64, json, os, random, re, shutil, socket, subprocess, sys, threading, time, traceback, webbrowser
 from pathlib import Path
 
-VERSION = "1.3"
+VERSION = "1.4"
 
 # ---------------- config ----------------
 
@@ -937,6 +937,10 @@ async def main_async():
         web.get("/tv.m3u", playlist),
         web.get("/t/{id}", thumb_h),
         web.get("/f/{id}", stream_h),
+        web.get("/live/{id}", live_page),
+        web.get("/m3u/{id}", m3u_h),
+        web.get("/seg/{id}/{u:.+}", seg_h),
+        web.get("/file/{id}", file_h),
     ])
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1350,18 +1354,12 @@ class App:
 
     # ---------- actions ----------
     def open_item(self, mid, kind):
+        # v1.1 wala playback: default browser (TV app jaisa full-screen player)
         url = f"{base_url()}/f/{mid}"
-        if kind in ("video", "audio"):
-            it = index.get(mid) or {}
-            PlayerWin(self.root, url, title=(it.get("title") or "RC TV"),
-                      audio=(kind == "audio"))
-        elif kind == "photo":
-            PhotoWin(self.root, url)
-        else:  # sub/doc — system viewer
-            try:
-                os.startfile(url)
-            except Exception:
-                webbrowser.open(url)
+        try:
+            os.startfile(url)
+        except Exception:
+            webbrowser.open(url)
 
     def open_live(self):
         LiveWin(self.root)
@@ -1479,329 +1477,141 @@ class App:
             pass
 
 
-# ================= in-app playback: mpv (browser/VLC ki zaroorat nahi) =================
-# libmpv-2.dll exe ke bagal me bundled hai (baseline x86_64 — har CPU par chalega).
-# Video: mpv ka APNA player window (OSC controls, fullscreen, video khatam = band)
-# Audio: app ke andar chhota mini window. Ek waqt me ek playback (nayi purani ko band karti hai).
-import ctypes
+# ================= playback: v1.1 style — browser me chalega =================
+# Video/audio/photo: tile click -> default browser (os.startfile/webbrowser) — v1.1 wala
+# Live TV: local player page (hls.js) + server-side HLS proxy (headers/CORS server solve karta hai)
+from urllib.parse import urljoin
 
-_MPV = None
-_MPV_TRIED = False
-_CUR = None  # abhi chal raha playback (singleton)
+LIVE_CHANS = []  # LiveWin parse ke waqt bhar jata hai ({name,url,backup,hdrs,drm,logo,_i})
 
 
-def _mpv():
-    global _MPV, _MPV_TRIED
-    if _MPV_TRIED:
-        return _MPV
-    _MPV_TRIED = True
-    cands = [Path(getattr(sys, "_MEIPASS", "")) / "libmpv-2.dll",
-             app_dir() / "libmpv-2.dll", Path.cwd() / "libmpv-2.dll"]
-    for c in cands:
-        try:
-            c = c.resolve()
-            if c.exists():
-                try:
-                    os.add_dll_directory(str(c.parent))  # dependencies bhi isi folder me
-                except Exception:
-                    pass
-                _MPV = ctypes.CDLL(str(c))
-                _mpv_bind(_MPV)
-                log("mpv: " + c.name + " loaded")
-                return _MPV
-        except Exception as e:
-            log(f"mpv load fail {c}: {e}")
-    log("mpv: libmpv-2.dll nahi mila")
-    return None
+def b64e(s):
+    return base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
 
 
-def _mpv_bind(m):
-    m.mpv_create.restype = ctypes.c_void_p
-    m.mpv_initialize.argtypes = [ctypes.c_void_p]
-    m.mpv_initialize.restype = ctypes.c_int
-    m.mpv_terminate_destroy.argtypes = [ctypes.c_void_p]
-    m.mpv_set_option_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
-    m.mpv_set_option_string.restype = ctypes.c_int
-    m.mpv_set_property_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
-    m.mpv_set_property_string.restype = ctypes.c_int
-    m.mpv_get_property_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    m.mpv_get_property_string.restype = ctypes.c_char_p
-    m.mpv_command.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p)]
-    m.mpv_command.restype = ctypes.c_int
-    m.mpv_free.argtypes = [ctypes.c_void_p]
-    m.mpv_request_log_messages.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-
-
-def _mmss(t):
+def b64d(s):
     try:
-        t = int(float(t))
+        return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)).decode(errors="ignore")
     except Exception:
-        return "0:00"
-    return f"{t // 60}:{t % 60:02d}"
+        return ""
 
 
-class PlayerWin:
-    """Ek playback = ek mpv instance.
-    Video/Live: mpv ka apna window — seek bar, pause, fullscreen (F/double-click),
-    q/Esc band, video khatam hone par khud band (TV player jaisa).
-    Audio: app ke andar mini window (Esc band · Space pause · Up/Down volume).
-    Nayi playback purani ko band kar deti hai — window stack nahi banta."""
+def _live_ch(idx):
+    try:
+        return LIVE_CHANS[int(idx)]
+    except Exception:
+        return None
 
-    def __init__(self, master, url, title="", headers=None, audio=False, live=False):
-        global _CUR
-        self.url = url
-        self.title = title or "RC TV"
-        self.live = live
-        self.audio = audio
-        self.h = None
-        self.dead = False
-        self.played = False
-        self.eof = False
-        if _CUR is not None:
-            try:
-                _CUR.terminate()
-            except Exception:
-                pass
-        _CUR = self
-        if audio:
-            self._mini_window(master)
-        self._start(headers)
-        threading.Thread(target=self._watch, daemon=True).start()
 
-    # ---- audio ka mini window (video me tk window nahi — mpv apna banata hai) ----
-    def _mini_window(self, master):
-        self.win = tk.Toplevel(master)
-        self.win.title("♪  " + self.title)
-        self.win.configure(bg="#000000")
-        self.win.geometry("520x110")
-        self.win.resizable(False, False)
-        tk.Label(self.win, text="♪  " + self.title, bg="#000000", fg=ACC2,
-                 font=("Segoe UI", 12, "bold"), wraplength=500).pack(expand=True, fill="both")
-        self.stat = tk.Label(self.win, text="Esc = band · Space = pause · Up/Down volume",
-                             bg="#0A0A0C", fg=SUB, font=("Segoe UI", 9))
-        self.stat.pack(fill="x")
-        for seq in ("<Escape>", "<q>"):
-            self.win.bind(seq, lambda e: self.close())
-        for seq in ("<space>", "<m>", "<Up>", "<Down>"):
-            self.win.bind(seq, self._key)
-        self.win.protocol("WM_DELETE_WINDOW", self.close)
-
-    # ---- mpv boot ----
-    def _start(self, headers):
-        m = _mpv()
-        if not m:
-            msg = "⚠ player (libmpv-2.dll) load nahi hua — exe ke bagal me dll honi chahiye"
-            if self.audio:
-                self.stat.configure(text=msg)
-            else:
-                try:
-                    from tkinter import messagebox
-                    messagebox.showerror("RC TV", msg + "\nApp dobara install karo.")
-                except Exception:
-                    pass
-            return
+def _up_headers(url, hdrs):
+    h = {"User-Agent": UA_LIVE}
+    for k, v in (hdrs or {}).items():
         try:
-            h = ctypes.c_void_p(m.mpv_create())
-            if not h:
-                raise RuntimeError("mpv_create null")
-            _o = lambda k, v: m.mpv_set_option_string(h, k.encode(), str(v).encode())
-            if not self.audio:
-                _o("force-window", "yes")            # mpv apna video window banata hai
-                _o("vo", "gpu,gdi")                   # gpu nahi to software render
-                _o("hwdec", "auto-safe")
-                _o("osc", "yes")                      # seek bar / play / fullscreen controls
-                _o("input-default-bindings", "yes")   # mpv ke saare player keys (q/Esc/f/space/arrows)
-                _o("input-vo-keyboard", "yes")
-                _o("keep-open", "no")                 # video khatam = window band (TV jaisa)
-            else:
-                _o("vo", "null")                      # audio: koi video layer nahi
-                _o("force-window", "no")
-            _o("title", self.title)
-            _o("cache", "yes")
-            _o("demuxer-max-bytes", "128MiB")
-            _o("demuxer-readahead-secs", "20")
-            _o("volume", "100")
-            _o("audio-display", "no")
-            _o("osd-playing-msg", self.title[:60])
-            if self.live:
-                _o("demuxer-lavf-o", "live=1")
-            if "--autotest" in sys.argv:
-                _o("ao", "null")        # wine/sandbox me audio device nahi
-                _o("untimed", "yes")    # playback instant-complete (eof proof)
-            hdrs = []
-            for k, v in (headers or {}).items():
-                hdrs.append(f"{k.capitalize()}: {str(v).replace(',', '')}")
-            if hdrs:
-                _o("http-header-fields", ",".join(hdrs))
-                _o("user-agent", headers.get("user-agent") or UA_LIVE)
-            if m.mpv_initialize(h) != 0:
-                raise RuntimeError("mpv_initialize fail")
-            m.mpv_request_log_messages(h, b"warn")
-            self.h = h
-            argv = (ctypes.c_char_p * 3)(b"loadfile", self.url.encode(), None)
-            if m.mpv_command(h, argv) != 0:
-                raise RuntimeError("loadfile fail")
-            log(f"player: loadfile {self.title[:40]} audio={self.audio} live={self.live}")
-        except Exception as e:
-            log("player error: " + repr(e))
-            if self.audio:
-                self.stat.configure(text="⚠ player error: " + str(e)[:120])
-            else:
-                try:
-                    from tkinter import messagebox
-                    messagebox.showerror("RC TV", "Ye file chal nahi payi: " + str(e)[:120])
-                except Exception:
-                    pass
-
-    def _prop(self, name):
-        if not self.h or self.dead:
-            return None
-        m = _MPV
-        try:
-            v = m.mpv_get_property_string(self.h, name.encode())
-        except Exception:
-            return None
-        if not v:
-            return None
-        s = v.decode(errors="ignore")
-        m.mpv_free(v)
-        return s
-
-    def _cmd(self, *args):
-        if not self.h or self.dead:
-            return
-        argv = (ctypes.c_char_p * (len(args) + 1))(*[a.encode() for a in args], None)
-        try:
-            _MPV.mpv_command(self.h, argv)
+            h[str(k).lower()] = str(v)
         except Exception:
             pass
+    return h
 
-    def _setp(self, name, val):
-        if self.h and not self.dead:
+
+# ---- live: HLS playlist proxy (headers server-side, segments localhost par) ----
+async def m3u_h(request):
+    ch = _live_ch(request.match_info["id"])
+    if not ch:
+        raise web.HTTPNotFound()
+    url = ch["backup"] if request.query.get("b") and ch.get("backup") else ch["url"]
+    hdrs = ch["hdrs"]
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url, headers=_up_headers(url, hdrs),
+                         timeout=aiohttp.ClientTimeout(total=25)) as r:
+            txt = await r.text()
+            base = str(r.url)
+    out = []
+    cid = request.match_info["id"]
+    qs = "?b=1" if request.query.get("b") else ""
+    for line in txt.splitlines():
+        ls = line.strip()
+        if not ls:
+            continue
+        if ls.startswith("#"):
+            ls = re.sub(r'URI="([^"]+)"',
+                        lambda m: 'URI="/seg/%s/%s%s"' % (cid, b64e(urljoin(base, m.group(1))), qs),
+                        ls)
+            out.append(ls)
+        else:
+            out.append("/seg/%s/%s%s" % (cid, b64e(urljoin(base, ls)), qs))
+    return web.Response(text="\n".join(out),
+                        content_type="application/vnd.apple.mpegurl")
+
+
+async def seg_h(request):
+    ch = _live_ch(request.match_info["id"])
+    u = b64d(request.match_info["u"])
+    if not ch or not u:
+        raise web.HTTPNotFound()
+    hdrs = _up_headers(u, ch["hdrs"])
+    rng = request.headers.get("Range")
+    if rng:
+        hdrs["Range"] = rng
+    async with aiohttp.ClientSession() as s:
+        async with s.get(u, headers=hdrs) as r:
+            data = await r.read()
+            ct = r.headers.get("Content-Type", "video/mp2t")
+    return web.Response(body=data, content_type=ct)
+
+
+async def file_h(request):
+    ch = _live_ch(request.match_info["id"])
+    if not ch:
+        raise web.HTTPNotFound()
+    url = ch["backup"] if request.query.get("b") and ch.get("backup") else ch["url"]
+    hdrs = _up_headers(url, ch["hdrs"])
+    rng = request.headers.get("Range")
+    if rng:
+        hdrs["Range"] = rng
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url, headers=hdrs) as r:
+            out_h = {k: v for k, v in r.headers.items()
+                     if k.lower() in ("content-type", "content-length", "content-range", "accept-ranges")}
+            resp = web.StreamResponse(status=r.status, headers=out_h)
+            await resp.prepare(request)
             try:
-                _MPV.mpv_set_property_string(self.h, name.encode(), str(val).encode())
-            except Exception:
+                async for c in r.content.iter_chunked(65536):
+                    await resp.write(c)
+            except (ConnectionResetError, asyncio.CancelledError):
                 pass
-
-    # ---- audio mini-window keys ----
-    def _key(self, e):
-        k = getattr(e, "keysym", "")
-        if k in ("Escape", "q"):
-            self.close()
-        elif k == "space":
-            p = self._prop("pause")
-            self._setp("pause", "no" if p == "yes" else "yes")
-        elif k == "m":
-            p = self._prop("mute")
-            self._setp("mute", "no" if p == "yes" else "yes")
-        elif k == "Up":
-            try:
-                self._setp("volume", min(130, int(float(self._prop("volume") or 100) + 8)))
-            except Exception:
-                pass
-        elif k == "Down":
-            try:
-                self._setp("volume", max(0, int(float(self._prop("volume") or 100) - 8)))
-            except Exception:
-                pass
-        return "break"
-
-    # ---- background watcher: played marker + eof cleanup ----
-    def _watch(self):
-        while not self.dead:
-            time.sleep(1)
-            if self.dead or not self.h:
-                return
-            try:
-                pos = self._prop("time-pos")
-                if pos:
-                    self.played = True
-                if self._prop("eof-reached") == "True":
-                    self.eof = True
-                    log(f"player: eof {self.title[:30]}")
-                    self.terminate()
-                    return
-            except Exception:
-                return
-
-    def close(self):
-        self.terminate()
-
-    def terminate(self):
-        global _CUR
-        if self.dead:
-            return
-        self.dead = True
-        if _CUR is self:
-            _CUR = None
-        try:
-            if self.h:
-                _MPV.mpv_terminate_destroy(self.h)
-                self.h = None
-        except Exception:
-            pass
-        if self.audio:
-            try:
-                self.win.destroy()
-            except Exception:
-                pass
+    return resp
 
 
-# ---- photos: PIL viewer (app ke andar, browser nahi) ----
-class PhotoWin:
-    def __init__(self, master, url):
-        self.url = url
-        self.win = tk.Toplevel(master)
-        self.win.title("RC TV — photo")
-        self.win.configure(bg="#050507")
-        self.win.geometry("880x620")
-        self.zoom = 1.0
-        self.img0 = None
-        self.lbl = tk.Label(self.win, bg="#050507", text="load ho raha hai…", fg=SUB)
-        self.lbl.pack(fill="both", expand=True)
-        self.win.bind("<Escape>", lambda e: self.win.destroy())
-        self.win.bind("<MouseWheel>", self._wheel)
-        self.win.bind("<Double-Button-1>", lambda e: self._render(1.0))
-        self.win.protocol("WM_DELETE_WINDOW", self.win.destroy)
-        self._fetch()
+LIVE_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{name} — RC TV</title>
+<style>html,body{{margin:0;height:100%;background:#000;overflow:hidden}}
+video{{width:100vw;height:100vh;object-fit:contain;background:#000}}</style></head>
+<body><video id="v" autoplay controls playsinline></video>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<script>
+var src = "{src}";
+var v = document.getElementById("v");
+function direct() {{ v.src = src; }}
+if (src.indexOf(".m3u8") !== -1 && typeof Hls !== "undefined" && Hls.isSupported()) {{
+  var h = new Hls({{ maxBufferLength: 30, liveSyncDurationCount: 3 }});
+  h.loadSource(src); h.attachMedia(v);
+  h.on(Hls.Events.ERROR, function (e, d) {{
+    if (d.fatal) {{ h.destroy(); direct(); }}
+  }});
+}} else {{ direct(); }}
+</script></body></html>"""
 
-    def _fetch(self):
-        from PIL import Image
-        self._Image = Image
-        def work():
-            try:
-                req = urllib.request.Request(self.url, headers={"User-Agent": "rctv"})
-                data = urllib.request.urlopen(req, timeout=30).read()
-                self.win.after(0, lambda: self._got(data))
-            except Exception as e:
-                self.win.after(0, lambda: self.lbl.configure(text="photo load fail: " + str(e)[:80]))
-        threading.Thread(target=work, daemon=True).start()
 
-    def _got(self, data):
-        import io
-        try:
-            self.img0 = self._Image.open(io.BytesIO(data))
-            self.img0.load()
-            self._render(1.0)
-        except Exception as e:
-            self.lbl.configure(text="photo khol nahi paye: " + str(e)[:80])
-
-    def _render(self, zoom):
-        if not self.img0:
-            return
-        from PIL import ImageTk
-        self.zoom = max(0.05, min(12.0, zoom))
-        w, h = self.img0.size
-        base = min((self.win.winfo_width() or 860) / w, (self.win.winfo_height() or 600) / h, 1.0)
-        s = base * self.zoom
-        im = self.img0.resize((max(1, int(w * s)), max(1, int(h * s))))
-        self.ph = ImageTk.PhotoImage(im)
-        self.lbl.configure(image=self.ph, text="")
-        self.win.title(f"RC TV — photo  {int(self.zoom * 100)}%")
-
-    def _wheel(self, e):
-        d = 1.15 if getattr(e, "delta", 0) > 0 else 1 / 1.15
-        self._render(self.zoom * d)
+async def live_page(request):
+    ch = _live_ch(request.match_info["id"])
+    if not ch:
+        raise web.HTTPNotFound()
+    qs = "?b=1" if request.query.get("b") else ""
+    is_m3u = ".m3u8" in (ch.get("url") or "") or ".m3u8" in (ch.get("backup") or "")
+    src = f"/m3u/{request.match_info['id']}{qs}" if is_m3u else f"/file/{request.match_info['id']}{qs}"
+    return web.Response(text=LIVE_PAGE.format(name=ch["name"], src=src),
+                        content_type="text/html")
 
 
 # ================= Live TV (TV app wale 3 servers — 2000+ channels) =================
@@ -2019,6 +1829,10 @@ class LiveWin:
     def _load_work(self):
         chans = _live_fetch_server(self.server)
         def done():
+            global LIVE_CHANS
+            for i, c in enumerate(chans):
+                c["_i"] = i
+            LIVE_CHANS = chans
             self.chans = chans
             self.sub.configure(text=f"{len(chans)} channels")
             self._cats()
@@ -2113,11 +1927,18 @@ class LiveWin:
             if ch["drm"]:
                 self._play_fail_drm(ch)
             else:
-                PlayerWin(self.win, ch["url"], title=ch["name"], headers=ch["hdrs"], live=True)
+                url = f"{base_url()}/live/{ch.get('_i', 0)}"
+                try:
+                    os.startfile(url)
+                except Exception:
+                    webbrowser.open(url)
         def backup(e):
             if ch["backup"]:
-                PlayerWin(self.win, ch["backup"], title=ch["name"] + " (backup)",
-                          headers=ch["hdrs"], live=True)
+                url = f"{base_url()}/live/{ch.get('_i', 0)}?b=1"
+                try:
+                    os.startfile(url)
+                except Exception:
+                    webbrowser.open(url)
         def link(e):
             self.win.clipboard_clear()
             self.win.clipboard_append(ch["url"])
@@ -2179,36 +2000,14 @@ def main():
     root = tk.Tk()
     app = App(root)
 
-    # --autotest: 18s baad player+livewin khol ke log likhwa do (wine/CI verify)
+    # --autotest: 18s baad index+livewin khol ke log likhwa do (wine/CI verify)
     if "--autotest" in sys.argv:
         def _at():
             try:
-                vids = [i for i in list(index.values()) if i.get("kind") == "video"]
-                if vids:
-                    pw = PlayerWin(root, f"{base_url()}/f/{vids[0]['id']}", title="autotest")
-                    log("AUTOTEST: player open ho gaya")
-
-                    def _chk(i=0):
-                        try:
-                            if pw.played or pw.eof:
-                                log(f"AUTOTEST-PLAYING (played={pw.played} eof={pw.eof})")
-                            elif i > 25:
-                                log("AUTOTEST-NOSTART (25s me playback start nahi hua)")
-                            else:
-                                root.after(1000, lambda: _chk(i + 1))
-                                return
-                        except Exception as e:
-                            log("AUTOTEST-ERR chk: " + repr(e))
-                            return
-                        lw = LiveWin(root)
-                        log("AUTOTEST: livewin open ho gaya")
-                        root.after(40000, lambda: log("AUTOTEST-DONE"))
-                    root.after(2000, _chk)
-                else:
-                    log("AUTOTEST: index khali (video nahi aaya)")
-                    lw = LiveWin(root)
-                    log("AUTOTEST: livewin open ho gaya")
-                    root.after(40000, lambda: log("AUTOTEST-DONE"))
+                log(f"AUTOTEST: index {len(index)} items, /f/ aur /live routes ready")
+                lw = LiveWin(root)
+                log("AUTOTEST: livewin open ho gaya")
+                root.after(40000, lambda: log("AUTOTEST-DONE"))
             except Exception as e:
                 log("AUTOTEST-ERR: " + repr(e))
                 root.after(1000, lambda: log("AUTOTEST-DONE"))
